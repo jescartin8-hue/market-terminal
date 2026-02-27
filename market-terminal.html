@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Market Terminal</title>
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet"/>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #080c10; color: #e0e0e0; font-family: 'Syne', sans-serif; min-height: 100vh; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: #0d1117; }
+  ::-webkit-scrollbar-thumb { background: #1e2530; border-radius: 2px; }
+  input { outline: none; }
+  input::placeholder { color: #2a2a2a; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+const TICKERS_RAW = [
+  "ASML","PFE","SQM","UPS","PYPL","NVO","MGM","WBD","SPG","DHI","GOOG","HPQ",
+  "CCU","DOLE","GIS","KHC","NSRGY","MC.PA","SAN.PA","RI.PA","NA9.DE","AMS.MC",
+  "VOW.DE","BABA","2020.HK","DEO","AXP","IFF","NKE","ABT","ADBE","STZ","MRK",
+  "BAK","EPAM","PGR","STLA","TM","UNH","AA","AAL","CE","EL","O","JD","VSCO",
+  "BF-B","MMM","UHAL","JKS","META","AMZN","MSFT","CROX","DIS","PEP","BMY",
+  "LEN","NEE","QCOM","CVS","SBUX","PG","KMB","BALL","MATX","INMD","ZTS",
+  "ABNB","FISV","ZM","DE","AVGO","TDW","CTRA","NVDA","GMAB","TSLA","PLTR",
+  "MELI","CAAP","GRBK","ACN","COP","PK","CMCSA","DELL","V","HRB","ORCL",
+  "PAGS","HAL","CNH","OSCR","DVA","NCLH","MAT","HEIA.AS","CNI","MICC","SFM",
+  "AMD","DECK","LLY","NFLX","UBER","BKNG","MA","LTM"
+];
+const TICKERS = [...new Set(TICKERS_RAW)];
+
+const formatNum = (n, dec = 2) =>
+  n == null || isNaN(n) ? "—" : Number(n).toFixed(dec);
+
+const formatLarge = (n) => {
+  if (n == null || isNaN(n)) return "—";
+  if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(2) + "T";
+  if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(2) + "B";
+  if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  return n.toLocaleString();
+};
+
+// When opened as a local file (file://) we MUST use a proxy.
+// When opened from a web server (http/https) Yahoo may allow direct fetch.
+// We try direct first, then fallback to corsproxy.io
+async function yahooFetch(url) {
+  // Try direct first
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+    if (res.ok) return await res.json();
+  } catch (_) {}
+  // Fallback: corsproxy.io
+  const res = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+async function fetchStock(ticker) {
+  const url = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}&fields=regularMarketPrice,regularMarketChangePercent,regularMarketChange,regularMarketPreviousClose,regularMarketVolume,marketCap,trailingEps,forwardEps,trailingPE,forwardPE,shortName,longName,currency,fullExchangeName`;
+  const data = await yahooFetch(url);
+  const q = data?.quoteResponse?.result?.[0];
+  if (!q) throw new Error("No data for " + ticker);
+  return {
+    ticker,
+    name: q.longName || q.shortName || ticker,
+    price: q.regularMarketPrice ?? null,
+    prevClose: q.regularMarketPreviousClose ?? null,
+    change: q.regularMarketChange ?? null,
+    changePct: q.regularMarketChangePercent ?? null,
+    volume: q.regularMarketVolume ?? null,
+    marketCap: q.marketCap ?? null,
+    currency: q.currency ?? "USD",
+    exchangeName: q.fullExchangeName ?? null,
+    epsTTM: q.trailingEps ?? null,
+    epsForward: q.forwardEps ?? null,
+    peRatio: q.trailingPE ?? null,
+    fwdPE: q.forwardPE ?? null,
+    sparkline: [],
+  };
+}
+
+async function fetchSparkline(ticker) {
+  try {
+    const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=1mo`;
+    const data = await yahooFetch(url);
+    const closes = data?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+    return closes.filter(v => v != null).slice(-20);
+  } catch { return []; }
+}
+
+function Sparkline({ data, positive }) {
+  if (!data || data.length < 2) return <span style={{color:"#444",fontSize:9}}>—</span>;
+  const w = 80, h = 28;
+  const min = Math.min(...data), max = Math.max(...data), range = max - min || 1;
+  const pts = data.map((v,i) => {
+    const x = (i/(data.length-1))*w;
+    const y = h-((v-min)/range)*(h-2)-1;
+    return `${x},${y}`;
+  }).join(" ");
+  const color = positive ? "#00e5a0" : "#ff4d6d";
+  return (
+    <svg width={w} height={h} style={{display:"block"}}>
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round"/>
+    </svg>
+  );
+}
+
+function Pill({ label, value, color="#a0c4ff" }) {
+  return (
+    <div style={{background:"rgba(255,255,255,0.05)",borderRadius:4,padding:"2px 7px",fontSize:9,fontFamily:"'Space Mono',monospace",display:"flex",gap:4,alignItems:"center"}}>
+      <span style={{color:"#555"}}>{label}</span>
+      <span style={{color:value!=null?color:"#333",fontWeight:700}}>{value!=null?formatNum(value):"—"}</span>
+    </div>
+  );
+}
+
+function StockCard({ stock, onClick, selected }) {
+  const pos = (stock.changePct??0) >= 0;
+  return (
+    <div onClick={()=>onClick(stock)} style={{
+      background: selected?"rgba(0,229,160,0.07)":"rgba(255,255,255,0.025)",
+      border:`1px solid ${selected?"#00e5a0":"rgba(255,255,255,0.07)"}`,
+      borderRadius:12,padding:"14px 16px",cursor:"pointer",
+      transition:"border-color 0.15s,background 0.15s",
+      display:"flex",flexDirection:"column",gap:8,
+    }}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div>
+          <div style={{fontFamily:"'Space Mono',monospace",fontSize:13,color:"#00e5a0",fontWeight:700}}>{stock.ticker}</div>
+          <div style={{fontSize:10,color:"#666",marginTop:2,maxWidth:120,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{stock.name}</div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontFamily:"'Space Mono',monospace",fontSize:15,fontWeight:700,color:"#f0f0f0"}}>
+            {stock.price!=null?`${stock.currency==="USD"?"$":""}${formatNum(stock.price)}`:"—"}
+          </div>
+          <div style={{fontSize:11,color:pos?"#00e5a0":"#ff4d6d",fontWeight:700,marginTop:1}}>
+            {stock.changePct!=null?`${pos?"▲":"▼"} ${formatNum(Math.abs(stock.changePct))}%`:"—"}
+          </div>
+        </div>
+      </div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <Sparkline data={stock.sparkline} positive={pos}/>
+        <div style={{fontSize:10,color:"#555",textAlign:"right",lineHeight:1.7}}>
+          <div>Vol <span style={{color:"#888"}}>{formatLarge(stock.volume)}</span></div>
+          <div>Cap <span style={{color:"#888"}}>{formatLarge(stock.marketCap)}</span></div>
+        </div>
+      </div>
+      <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+        <Pill label="EPS" value={stock.epsTTM} color="#00e5a0"/>
+        <Pill label="P/E" value={stock.peRatio} color="#a0c4ff"/>
+        <Pill label="Fwd EPS" value={stock.epsForward} color="#00e5a0"/>
+        <Pill label="Fwd P/E" value={stock.fwdPE} color="#a0c4ff"/>
+      </div>
+    </div>
+  );
+}
+
+function DetailPanel({ stock, onClose }) {
+  if (!stock) return null;
+  const pos = (stock.changePct??0) >= 0;
+  const lineColor = pos?"#00e5a0":"#ff4d6d";
+  const sym = stock.currency==="USD"?"$":(stock.currency?stock.currency+" ":"");
+  return (
+    <div style={{position:"fixed",top:0,right:0,height:"100vh",width:340,background:"#0b0f15",borderLeft:"1px solid rgba(0,229,160,0.12)",zIndex:100,padding:24,overflowY:"auto",boxShadow:"-20px 0 50px rgba(0,0,0,0.8)",display:"flex",flexDirection:"column",gap:20}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+        <div>
+          <div style={{fontFamily:"'Space Mono',monospace",fontSize:22,color:"#00e5a0",fontWeight:700}}>{stock.ticker}</div>
+          <div style={{fontSize:11,color:"#666",marginTop:3}}>{stock.name}</div>
+          <div style={{fontSize:10,color:"#444",marginTop:2,fontFamily:"'Space Mono',monospace"}}>{stock.exchangeName} · {stock.currency}</div>
+        </div>
+        <button onClick={onClose} style={{background:"none",border:"none",color:"#555",fontSize:22,cursor:"pointer"}}>✕</button>
+      </div>
+
+      <div style={{background:"rgba(255,255,255,0.03)",borderRadius:10,padding:16}}>
+        <div style={{fontFamily:"'Space Mono',monospace",fontSize:28,fontWeight:700,color:"#fff"}}>
+          {stock.price!=null?`${sym}${formatNum(stock.price)}`:"—"}
+        </div>
+        <div style={{fontSize:14,color:lineColor,fontWeight:700,marginTop:4,fontFamily:"'Space Mono',monospace"}}>
+          {stock.changePct!=null?`${pos?"▲ +":"▼ "}${formatNum(stock.change)} (${formatNum(stock.changePct)}%)`:"—"}
+        </div>
+        <div style={{fontSize:10,color:"#444",marginTop:6,fontFamily:"'Space Mono',monospace"}}>
+          PREV CLOSE {stock.prevClose!=null?`${sym}${formatNum(stock.prevClose)}`:"—"}
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+        {[
+          ["Volume",formatLarge(stock.volume)],
+          ["Market Cap",formatLarge(stock.marketCap)],
+          ["EPS TTM",stock.epsTTM!=null?formatNum(stock.epsTTM):"—"],
+          ["P/E Ratio",stock.peRatio!=null?formatNum(stock.peRatio):"—"],
+          ["Forward EPS",stock.epsForward!=null?formatNum(stock.epsForward):"—"],
+          ["Forward P/E",stock.fwdPE!=null?formatNum(stock.fwdPE):"—"],
+        ].map(([label,val])=>(
+          <div key={label} style={{background:"rgba(255,255,255,0.03)",borderRadius:8,padding:"10px 12px"}}>
+            <div style={{fontSize:9,color:"#555",fontFamily:"'Space Mono',monospace",marginBottom:4,letterSpacing:0.5}}>{label.toUpperCase()}</div>
+            <div style={{fontFamily:"'Space Mono',monospace",fontSize:13,fontWeight:700,color:label.includes("EPS")||label.includes("P/E")?"#a0c4ff":"#e0e0e0"}}>{val}</div>
+          </div>
+        ))}
+      </div>
+
+      {(stock.epsTTM!=null||stock.epsForward!=null)&&(
+        <div>
+          <div style={{fontSize:10,color:"#444",fontFamily:"'Space Mono',monospace",marginBottom:10,letterSpacing:1}}>EPS COMPARISON</div>
+          {[["EPS TTM",stock.epsTTM,"#00e5a0"],["Forward EPS",stock.epsForward,"#a0c4ff"]].map(([label,val,c])=>{
+            const maxVal=Math.max(Math.abs(stock.epsTTM||0),Math.abs(stock.epsForward||0),0.01);
+            const pct=val!=null?Math.min(Math.abs(val)/maxVal*100,100):0;
+            return(
+              <div key={label} style={{marginBottom:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",marginBottom:5}}>
+                  <span style={{fontSize:10,color:"#666"}}>{label}</span>
+                  <span style={{fontSize:11,color:val!=null?c:"#333",fontFamily:"'Space Mono',monospace",fontWeight:700}}>{val!=null?formatNum(val):"—"}</span>
+                </div>
+                <div style={{background:"rgba(255,255,255,0.05)",borderRadius:3,height:5}}>
+                  <div style={{width:`${pct}%`,height:"100%",background:val!=null?c:"transparent",borderRadius:3,transition:"width 0.6s ease"}}/>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div>
+        <div style={{fontSize:10,color:"#444",marginBottom:8,fontFamily:"'Space Mono',monospace",letterSpacing:1}}>30-DAY PRICE</div>
+        {stock.sparkline&&stock.sparkline.length>1?(()=>{
+          const d=stock.sparkline;
+          const w=280,h=90;
+          const min=Math.min(...d),max=Math.max(...d),range=max-min||1;
+          const pts=d.map((v,i)=>`${(i/(d.length-1))*w},${h-((v-min)/range)*(h-6)-3}`);
+          const area=`M0,${h} ${pts.join(" ")} L${w},${h} Z`;
+          return(
+            <svg width={w} height={h}>
+              <defs>
+                <linearGradient id="grad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor={lineColor} stopOpacity="0.3"/>
+                  <stop offset="100%" stopColor={lineColor} stopOpacity="0"/>
+                </linearGradient>
+              </defs>
+              <path d={area} fill="url(#grad)"/>
+              <polyline points={pts.join(" ")} fill="none" stroke={lineColor} strokeWidth="2" strokeLinejoin="round"/>
+            </svg>
+          );
+        })():<div style={{color:"#444",fontSize:11,fontFamily:"'Space Mono',monospace"}}>NO CHART DATA</div>}
+      </div>
+
+      <a href={`https://finance.yahoo.com/quote/${stock.ticker}`} target="_blank" rel="noreferrer"
+        style={{display:"block",textAlign:"center",padding:"10px",background:"rgba(0,229,160,0.07)",border:"1px solid rgba(0,229,160,0.2)",borderRadius:8,color:"#00e5a0",fontSize:11,fontFamily:"'Space Mono',monospace",textDecoration:"none",letterSpacing:1}}>
+        VER EN YAHOO FINANCE ↗
+      </a>
+    </div>
+  );
+}
+
+function App() {
+  const [stocks, setStocks] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [progress, setProgress] = useState(0);
+  const [phase, setPhase] = useState("");
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState("changePct");
+  const [sortDir, setSortDir] = useState(-1);
+  const [selected, setSelected] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [errors, setErrors] = useState([]);
+
+  const loadAll = useCallback(async () => {
+    setLoading(true);
+    setProgress(0);
+    setErrors([]);
+    setStocks([]);
+    const results = [];
+    const errs = [];
+    const BATCH = 6;
+
+    setPhase("Fetching quotes...");
+    for (let i = 0; i < TICKERS.length; i += BATCH) {
+      const batch = TICKERS.slice(i, i+BATCH);
+      const settled = await Promise.allSettled(batch.map(fetchStock));
+      settled.forEach((s,j) => {
+        if (s.status==="fulfilled") results.push(s.value);
+        else errs.push(batch[j]);
+      });
+      setProgress(Math.round(((i+BATCH)/TICKERS.length)*70));
+      setStocks([...results]);
+      await new Promise(r=>setTimeout(r,80));
+    }
+
+    setPhase("Fetching charts...");
+    const withSpark = await Promise.all(
+      results.map(async (r,i) => {
+        const sparkline = await fetchSparkline(r.ticker);
+        setProgress(70+Math.round(((i+1)/results.length)*30));
+        return {...r, sparkline};
+      })
+    );
+
+    setProgress(100);
+    setPhase("");
+    setStocks(withSpark);
+    setErrors(errs);
+    setLastUpdated(new Date());
+    setLoading(false);
+  }, []);
+
+  useEffect(()=>{ loadAll(); },[loadAll]);
+
+  const handleSort = (field) => {
+    if (sortBy===field) setSortDir(d=>-d);
+    else { setSortBy(field); setSortDir(field==="changePct"?-1:1); }
+  };
+
+  const filtered = stocks
+    .filter(s => {
+      const q = search.toLowerCase();
+      return !q||s.ticker.toLowerCase().includes(q)||s.name.toLowerCase().includes(q);
+    })
+    .sort((a,b) => {
+      const va = a[sortBy]??(sortDir>0?Infinity:-Infinity);
+      const vb = b[sortBy]??(sortDir>0?Infinity:-Infinity);
+      if (typeof va==="string") return va.localeCompare(vb)*sortDir;
+      return (va-vb)*sortDir;
+    });
+
+  const gainers = [...stocks].filter(s=>(s.changePct??0)>0).sort((a,b)=>b.changePct-a.changePct).slice(0,3);
+  const losers  = [...stocks].filter(s=>(s.changePct??0)<0).sort((a,b)=>a.changePct-b.changePct).slice(0,3);
+
+  const SortBtn = ({field,label}) => (
+    <button onClick={()=>handleSort(field)} style={{
+      background:sortBy===field?"rgba(0,229,160,0.15)":"transparent",
+      border:`1px solid ${sortBy===field?"#00e5a0":"rgba(255,255,255,0.1)"}`,
+      color:sortBy===field?"#00e5a0":"#555",
+      borderRadius:6,padding:"4px 10px",fontSize:10,
+      cursor:"pointer",fontFamily:"'Space Mono',monospace",whiteSpace:"nowrap",
+    }}>
+      {label}{sortBy===field?(sortDir>0?" ↑":" ↓"):""}
+    </button>
+  );
+
+  return (
+    <>
+      {/* Header */}
+      <div style={{padding:"20px 28px 0",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+        <div>
+          <h1 style={{fontFamily:"'Syne'",fontWeight:800,fontSize:22,color:"#fff",letterSpacing:-0.5}}>
+            <span style={{color:"#00e5a0"}}>◈</span> MARKET TERMINAL
+          </h1>
+          <div style={{fontSize:10,color:"#333",marginTop:3,fontFamily:"'Space Mono',monospace"}}>
+            {lastUpdated?`UPDATED ${lastUpdated.toLocaleTimeString()}`:phase||"INITIALIZING..."}
+            {errors.length>0&&<span style={{color:"#ff9944",marginLeft:14}}>{errors.length} FAILED</span>}
+          </div>
+        </div>
+        <button onClick={loadAll} disabled={loading} style={{
+          background:"rgba(0,229,160,0.08)",border:"1px solid rgba(0,229,160,0.25)",
+          color:"#00e5a0",borderRadius:8,padding:"8px 18px",fontSize:11,
+          cursor:loading?"not-allowed":"pointer",fontFamily:"'Space Mono',monospace",
+          opacity:loading?0.4:1,
+        }}>
+          {loading?"↻ LOADING...":"↻ REFRESH"}
+        </button>
+      </div>
+
+      {/* Progress */}
+      {loading&&(
+        <div style={{margin:"12px 28px 0"}}>
+          <div style={{background:"rgba(255,255,255,0.04)",borderRadius:3,height:2}}>
+            <div style={{width:`${progress}%`,height:"100%",background:"#00e5a0",borderRadius:3,transition:"width 0.3s"}}/>
+          </div>
+          <div style={{fontSize:10,color:"#333",marginTop:5,fontFamily:"'Space Mono',monospace",textAlign:"center"}}>
+            {progress}% — {phase}
+          </div>
+        </div>
+      )}
+
+      {/* Top movers */}
+      {stocks.length>0&&(
+        <div style={{padding:"16px 28px 0",display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {[{label:"▲ TOP GAINERS",items:gainers,pos:true},{label:"▼ TOP LOSERS",items:losers,pos:false}].map(({label,items,pos})=>(
+            <div key={label} style={{background:"rgba(255,255,255,0.02)",border:"1px solid rgba(255,255,255,0.05)",borderRadius:10,padding:"12px 14px"}}>
+              <div style={{fontSize:9,color:pos?"#00e5a0":"#ff4d6d",fontFamily:"'Space Mono',monospace",marginBottom:8,letterSpacing:1}}>{label}</div>
+              {items.length===0&&<div style={{fontSize:10,color:"#333",fontFamily:"'Space Mono',monospace"}}>loading...</div>}
+              {items.map(s=>(
+                <div key={s.ticker} onClick={()=>setSelected(s)} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",cursor:"pointer",borderBottom:"1px solid rgba(255,255,255,0.03)"}}>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <span style={{fontFamily:"'Space Mono',monospace",fontSize:11,color:"#bbb"}}>{s.ticker}</span>
+                    <span style={{fontSize:9,color:"#444",fontFamily:"'Space Mono',monospace"}}>P/E {s.peRatio!=null?formatNum(s.peRatio):"—"}</span>
+                  </div>
+                  <span style={{fontSize:11,color:pos?"#00e5a0":"#ff4d6d",fontFamily:"'Space Mono',monospace",fontWeight:700}}>
+                    {pos?"+":""}{formatNum(s.changePct)}%
+                  </span>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Controls */}
+      <div style={{padding:"14px 28px",display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search ticker or name..."
+          style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:8,padding:"7px 14px",color:"#e0e0e0",fontSize:12,width:210,fontFamily:"'Syne',sans-serif"}}/>
+        <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+          {[["ticker","TICKER"],["price","PRICE"],["changePct","CHG%"],["volume","VOL"],["marketCap","CAP"],["epsTTM","EPS TTM"],["peRatio","P/E"],["epsForward","FWD EPS"],["fwdPE","FWD P/E"]].map(([f,l])=>(
+            <SortBtn key={f} field={f} label={l}/>
+          ))}
+        </div>
+        <div style={{marginLeft:"auto",fontSize:10,color:"#333",fontFamily:"'Space Mono',monospace"}}>
+          {filtered.length}/{stocks.length}
+        </div>
+      </div>
+
+      {/* Cards */}
+      <div style={{padding:"0 28px 80px",display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(235px,1fr))",gap:10,marginRight:selected?350:0,transition:"margin-right 0.3s"}}>
+        {filtered.map(s=>(
+          <div key={s.ticker} style={{animation:"fadeIn 0.2s ease both"}}>
+            <StockCard stock={s} onClick={setSelected} selected={selected?.ticker===s.ticker}/>
+          </div>
+        ))}
+        {!loading&&filtered.length===0&&(
+          <div style={{gridColumn:"1/-1",textAlign:"center",padding:80,color:"#333",fontFamily:"'Space Mono',monospace",fontSize:12}}>NO RESULTS</div>
+        )}
+      </div>
+
+      <DetailPanel stock={selected} onClose={()=>setSelected(null)}/>
+    </>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
